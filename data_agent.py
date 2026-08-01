@@ -27,7 +27,7 @@ import json
 from groq import Groq
 
 client = Groq()
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-120b"  # stronger tool-calling reliability than llama-3.3-70b for structured multi-step tasks
 
 DB_PATH = "chinook.db"
 
@@ -244,27 +244,28 @@ def ask_agent(question: str, history: list | None = None):
                 except json.JSONDecodeError:
                     args = {}
 
-                call_key = (name, raw_args)
+                # Normalize the key so equivalent calls (e.g. "{}" vs "")
+                # are reliably recognized as duplicates.
+                call_key = (name, json.dumps(args, sort_keys=True))
 
                 if call_key in seen_calls:
                     # The agent is repeating an identical call — don't waste
-                    # a round re-running it, just tell it to move on.
+                    # a round re-running it. Show it the cached result again
+                    # so it has something concrete to act on, rather than
+                    # just being told "don't repeat" with nothing to work with.
                     result = {
-                        "note": (
-                            "You already made this exact call earlier in this "
-                            "conversation — see the result above. Do not repeat "
-                            "it; use that information to proceed to the next step "
-                            "(inspecting another table, or running your SQL query)."
-                        )
+                        "note": "You already called this earlier — reusing that result, see below. Move on to your next step.",
+                        "cached_result": seen_calls[call_key],
                     }
-                    tool_log.append(f"(skipped repeated call: {name})")
+                    tool_log.append(f"(reused earlier result for repeated call: {name})")
                 else:
-                    seen_calls[call_key] = True
                     if name in TOOL_FUNCTIONS:
                         result = TOOL_FUNCTIONS[name](args)
                     else:
                         result = {"error": f"Unknown tool: {name}"}
                         tool_log.append(f"(agent tried unknown tool: {name})")
+
+                    seen_calls[call_key] = result
 
                     if name == "list_tables":
                         tool_log.append("Explored: listed all tables")
