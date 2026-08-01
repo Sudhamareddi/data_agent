@@ -146,7 +146,18 @@ def ask_agent(question: str, history: list | None = None):
                     "columns exist. Only call run_sql_query once you know the correct "
                     "table and column names. Remember what you've already learned "
                     "earlier in the conversation — no need to re-discover the same "
-                    "table twice."
+                    "table twice.\n\n"
+                    "IMPORTANT: Never guess a table or column name. If a table you "
+                    "expect doesn't appear in list_tables' results, look through the "
+                    "actual table list for the closest real match instead of assuming "
+                    "a name like 'Sales' exists — for example, sales/revenue data may "
+                    "be stored under a differently-named table (e.g. Invoice), and "
+                    "relationships between tables may go through a foreign key column "
+                    "rather than a direct table name match. Always inspect a table's "
+                    "schema with get_table_schema before assuming its columns.\n\n"
+                    "Always finish by giving a direct, plain-language answer to the "
+                    "user's question — never end a turn with only a tool call and no "
+                    "explanation."
                 ),
             }
         ]
@@ -156,19 +167,44 @@ def ask_agent(question: str, history: list | None = None):
     last_sql = None
     last_rows = None
     tool_log = []
+    MAX_TOOL_ROUNDS = 6  # safety cap so a confused agent can't loop forever
 
-    while True:
+    for round_num in range(MAX_TOOL_ROUNDS + 1):
+        # On the final allowed round, remove tools so the model is forced
+        # to answer with whatever it has learned so far, instead of trying
+        # (and failing) to call another tool.
+        force_final = round_num == MAX_TOOL_ROUNDS
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=tools,
+            tools=None if force_final else tools,
         )
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            messages.append({"role": "assistant", "content": msg.content})
+            answer_text = (msg.content or "").strip()
+            if not answer_text:
+                # The model returned nothing useful — ask it explicitly to
+                # summarize based on whatever was found, instead of showing
+                # a blank response to the user.
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You didn't provide a clear answer. Based on everything "
+                        "you've explored and queried so far, give your best "
+                        "direct answer now, in plain language."
+                    ),
+                })
+                retry = client.chat.completions.create(model=MODEL, messages=messages)
+                answer_text = (retry.choices[0].message.content or
+                               "I wasn't able to find a clear answer — could you rephrase the question?").strip()
+                messages.append({"role": "assistant", "content": answer_text})
+            else:
+                messages.append({"role": "assistant", "content": answer_text})
+
             return {
-                "answer": msg.content,
+                "answer": answer_text,
                 "sql": last_sql,
                 "rows": last_rows,
                 "tool_log": tool_log,
