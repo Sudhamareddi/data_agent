@@ -165,7 +165,12 @@ def ask_agent(question: str, history: list | None = None):
                     "user's question — never end a turn with only a tool call and no "
                     "explanation. If you are not able to call a tool, do not write out "
                     "fake tool-call syntax as text — just answer directly in plain "
-                    "language using whatever you've already learned."
+                    "language using whatever you've already learned.\n\n"
+                    "CRITICAL: Base your answer strictly on the actual data returned "
+                    "by your tool calls. Never claim a query returned no results, an "
+                    "empty list, or that no tables/data exist unless the tool result "
+                    "you actually received literally shows that. Do not describe a "
+                    "query as failed or empty if the returned rows contain data."
                 ),
             }
         ]
