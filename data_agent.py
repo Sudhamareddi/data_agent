@@ -1,86 +1,65 @@
 """
-Data/Analytics Agent (Free Version — uses Groq)
--------------------------------------------------
-Takes a natural-language question (e.g. "what were the top 3 products by
-revenue in the North region?"), decides to query the sales database using
-tool-calling, runs the SQL, and returns a plain-English answer.
+Data/Analytics Agent — v3 (agent discovers schema itself)
+--------------------------------------------------------------
+Upgrade from v2: previously we handed the full schema to the agent
+upfront in the system prompt. Now the agent is given ONLY 3 tools and
+has to explore the database on its own, the way a real analyst would
+approach an unfamiliar database:
 
-Uses Groq's free tier (fast open models like Llama 3.3, no cost) instead of
-a paid API, so this whole project can be built and hosted for free.
+  1. list_tables        -> "what tables exist?"
+  2. get_table_schema    -> "what columns does this table have?"
+  3. run_sql_query       -> "now run this SQL"
 
-HOW IT WORKS
-------------
-1. We give the model a "run_sql_query" tool and describe the database schema.
-2. The model decides what SQL to write to answer the question, and calls the tool.
-3. We execute that SQL against sales.db and return the results to the model.
-4. The model turns the raw rows into a clear, human-readable answer.
+This means the agent's first move on a brand-new question is usually to
+call list_tables and get_table_schema BEFORE it writes any SQL - you can
+literally watch it explore the database step by step.
 
-SETUP (all free)
------------------
+SETUP
+-----
 1. pip install groq --break-system-packages
-2. Run setup_db.py first to create sales.db
-3. Get a free API key at https://console.groq.com (sign up, no card needed
-   as of writing — always double check current terms)
-4. Set it: export GROQ_API_KEY="your-key-here"
-5. python data_agent.py
+2. Have chinook.db in the same folder (see setup_chinook.py)
+3. export GROQ_API_KEY="your-key-here"
+4. python data_agent.py
 """
 
 import sqlite3
 import json
-import os
 from groq import Groq
 
-client = Groq()  # reads GROQ_API_KEY from environment
-MODEL = "llama-3.3-70b-versatile"  # fast, free-tier model with tool-calling support
+client = Groq()
+MODEL = "llama-3.3-70b-versatile"
 
-DB_PATH = "sales.db"
+DB_PATH = "chinook.db"
 
-# ---- Describe the schema so the model knows what it can query ----
-SCHEMA_DESCRIPTION = """
-Table: sales
-Columns:
-  id INTEGER
-  order_date TEXT (format: YYYY-MM-DD)
-  product TEXT
-  category TEXT (Electronics, Furniture, Stationery)
-  region TEXT (North, South, East, West)
-  quantity INTEGER
-  unit_price REAL
-  revenue REAL (quantity * unit_price)
-"""
+# ---- Tool 1: list all tables (no columns yet — agent must ask separately) ----
+def list_tables():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return {"tables": tables}
 
-# ---- Tool definition (OpenAI-style function schema, which Groq uses) ----
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_sql_query",
-            "description": (
-                "Run a read-only SQL SELECT query against the sales database "
-                "and return the results. Use this to answer any question about "
-                "sales, revenue, products, regions, or categories."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "A valid SQLite SELECT query.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
+
+# ---- Tool 2: inspect one table's columns ----
+def get_table_schema(table_name: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    cols = cur.fetchall()
+    conn.close()
+    if not cols:
+        return {"error": f"Table '{table_name}' not found."}
+    return {
+        "table": table_name,
+        "columns": [{"name": c[1], "type": c[2]} for c in cols],
     }
-]
 
 
+# ---- Tool 3: run the actual query ----
 def run_sql_query(query: str):
-    """Executes a SQL query against sales.db and returns rows as a list of dicts."""
-    # Basic safety check: only allow SELECT statements
     if not query.strip().lower().startswith("select"):
         return {"error": "Only SELECT queries are allowed."}
-
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -94,47 +73,128 @@ def run_sql_query(query: str):
         conn.close()
 
 
-def ask_agent(question: str) -> str:
-    """
-    Sends the user's question to the model, lets it call the SQL tool as
-    needed, and returns the final natural-language answer.
-    """
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                f"You are a data analytics assistant. Here is the database schema:\n"
-                f"{SCHEMA_DESCRIPTION}\n"
-                f"Use the run_sql_query tool to answer the user's questions."
-            ),
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tables",
+            "description": "List all table names available in the database. Call this first if you don't yet know what tables exist.",
+            "parameters": {"type": "object", "properties": {}},
         },
-        {"role": "user", "content": question},
-    ]
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_table_schema",
+            "description": "Get the column names and types for a specific table. Call this before writing SQL that uses a table you haven't inspected yet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "description": "Exact table name, e.g. 'Customer'"}
+                },
+                "required": ["table_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sql_query",
+            "description": "Run a read-only SQL SELECT query (joins allowed) once you know the relevant table names and columns.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "A valid SQLite SELECT query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
 
-    # Loop until the model stops calling tools and gives a final answer
+TOOL_FUNCTIONS = {
+    "list_tables": lambda args: list_tables(),
+    "get_table_schema": lambda args: get_table_schema(args["table_name"]),
+    "run_sql_query": lambda args: run_sql_query(args["query"]),
+}
+
+
+def ask_agent(question: str, history: list | None = None):
+    """
+    Sends the question to the model. The model must explore the database
+    itself (list_tables / get_table_schema) before it can run SQL, unless
+    it already learned the structure earlier in this conversation.
+
+    Returns a dict:
+      {
+        "answer": final natural-language answer (str),
+        "sql": the last SQL query actually run (str or None),
+        "rows": the raw rows from that query (list or None),
+        "tool_log": ordered list of every tool call made this turn,
+                    e.g. ["list_tables", "get_table_schema(Customer)", "run_sql_query(...)"]
+        "history": updated message history to pass into the next call
+      }
+    """
+    if history is None:
+        history = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a data analytics assistant for a music store database. "
+                    "You do NOT know the schema in advance. Before writing any SQL, "
+                    "use list_tables and get_table_schema to discover what tables and "
+                    "columns exist. Only call run_sql_query once you know the correct "
+                    "table and column names. Remember what you've already learned "
+                    "earlier in the conversation — no need to re-discover the same "
+                    "table twice."
+                ),
+            }
+        ]
+
+    messages = history + [{"role": "user", "content": question}]
+
+    last_sql = None
+    last_rows = None
+    tool_log = []
+
     while True:
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
             tools=tools,
         )
-
         msg = response.choices[0].message
 
         if not msg.tool_calls:
-            # No more tool calls -> this is the final answer
-            return msg.content
+            messages.append({"role": "assistant", "content": msg.content})
+            return {
+                "answer": msg.content,
+                "sql": last_sql,
+                "rows": last_rows,
+                "tool_log": tool_log,
+                "history": messages,
+            }
 
-        # Add the assistant's tool-call message to history
         messages.append(msg)
 
-        # Execute each requested tool call and send results back
         for tool_call in msg.tool_calls:
-            if tool_call.function.name == "run_sql_query":
-                args = json.loads(tool_call.function.arguments)
-                result = run_sql_query(args["query"])
+            name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments or "{}")
+
+            if name in TOOL_FUNCTIONS:
+                result = TOOL_FUNCTIONS[name](args)
             else:
-                result = {"error": f"Unknown tool: {tool_call.function.name}"}
+                result = {"error": f"Unknown tool: {name}"}
+
+            # Log what the agent did, in plain form, for display in the UI
+            if name == "list_tables":
+                tool_log.append("Explored: listed all tables")
+            elif name == "get_table_schema":
+                tool_log.append(f"Explored: inspected columns of '{args.get('table_name')}'")
+            elif name == "run_sql_query":
+                last_sql = args.get("query")
+                last_rows = result.get("rows")
+                tool_log.append(f"Ran SQL query")
 
             messages.append({
                 "role": "tool",
@@ -144,10 +204,18 @@ def ask_agent(question: str) -> str:
 
 
 if __name__ == "__main__":
-    print("Data Analytics Agent — ask a question about the sales data (or 'quit' to exit)\n")
+    print("Data Analytics Agent (self-discovering schema) — 'quit' to exit\n")
+    conversation_history = None
     while True:
         question = input("You: ")
         if question.strip().lower() in ("quit", "exit"):
             break
-        answer = ask_agent(question)
-        print(f"\nAgent: {answer}\n")
+        result = ask_agent(question, conversation_history)
+        conversation_history = result["history"]
+
+        print("\n--- Agent's exploration steps ---")
+        for step in result["tool_log"]:
+            print(f"  • {step}")
+        if result["sql"]:
+            print(f"\n[Final SQL used: {result['sql']}]")
+        print(f"\nAgent: {result['answer']}\n")
