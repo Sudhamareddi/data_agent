@@ -170,14 +170,17 @@ def ask_agent(question: str, history: list | None = None):
     MAX_TOOL_ROUNDS = 6  # safety cap so a confused agent can't loop forever
 
     for round_num in range(MAX_TOOL_ROUNDS + 1):
-        # On the final allowed round, remove tools so the model is forced
-        # to answer with whatever it has learned so far, instead of trying
-        # (and failing) to call another tool.
+        # On the final allowed round, force a text-only answer using
+        # tool_choice="none" instead of removing `tools` entirely — Groq
+        # (like OpenAI) requires `tools` to stay present if earlier messages
+        # in the conversation already contain tool calls, otherwise it
+        # rejects the request as invalid.
         force_final = round_num == MAX_TOOL_ROUNDS
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=None if force_final else tools,
+            tools=tools,
+            tool_choice="none" if force_final else "auto",
         )
         msg = response.choices[0].message
 
@@ -196,7 +199,9 @@ def ask_agent(question: str, history: list | None = None):
                         "direct answer now, in plain language."
                     ),
                 })
-                retry = client.chat.completions.create(model=MODEL, messages=messages)
+                retry = client.chat.completions.create(
+                    model=MODEL, messages=messages, tools=tools, tool_choice="none"
+                )
                 answer_text = (retry.choices[0].message.content or
                                "I wasn't able to find a clear answer — could you rephrase the question?").strip()
                 messages.append({"role": "assistant", "content": answer_text})
