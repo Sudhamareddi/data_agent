@@ -175,7 +175,21 @@ def ask_agent(question: str, history: list | None = None):
                 "history": messages,
             }
 
-        messages.append(msg)
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ],
+        })
 
         for tool_call in msg.tool_calls:
             name = tool_call.function.name
