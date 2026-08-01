@@ -167,95 +167,140 @@ def ask_agent(question: str, history: list | None = None):
     last_sql = None
     last_rows = None
     tool_log = []
+    seen_calls = {}  # tracks (tool_name, args_json) -> True, to catch repeated calls
     MAX_TOOL_ROUNDS = 6  # safety cap so a confused agent can't loop forever
 
-    for round_num in range(MAX_TOOL_ROUNDS + 1):
-        # On the final allowed round, force a text-only answer using
-        # tool_choice="none" instead of removing `tools` entirely — Groq
-        # (like OpenAI) requires `tools` to stay present if earlier messages
-        # in the conversation already contain tool calls, otherwise it
-        # rejects the request as invalid.
-        force_final = round_num == MAX_TOOL_ROUNDS
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice="none" if force_final else "auto",
-        )
-        msg = response.choices[0].message
+    try:
+        for round_num in range(MAX_TOOL_ROUNDS + 1):
+            # On the final allowed round, force a text-only answer using
+            # tool_choice="none" instead of removing `tools` entirely — Groq
+            # (like OpenAI) requires `tools` to stay present if earlier messages
+            # in the conversation already contain tool calls, otherwise it
+            # rejects the request as invalid.
+            force_final = round_num == MAX_TOOL_ROUNDS
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=tools,
+                tool_choice="none" if force_final else "auto",
+            )
+            msg = response.choices[0].message
 
-        if not msg.tool_calls:
-            answer_text = (msg.content or "").strip()
-            if not answer_text:
-                # The model returned nothing useful — ask it explicitly to
-                # summarize based on whatever was found, instead of showing
-                # a blank response to the user.
-                messages.append({"role": "assistant", "content": msg.content or ""})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You didn't provide a clear answer. Based on everything "
-                        "you've explored and queried so far, give your best "
-                        "direct answer now, in plain language."
-                    ),
-                })
-                retry = client.chat.completions.create(
-                    model=MODEL, messages=messages, tools=tools, tool_choice="none"
-                )
-                answer_text = (retry.choices[0].message.content or
-                               "I wasn't able to find a clear answer — could you rephrase the question?").strip()
-                messages.append({"role": "assistant", "content": answer_text})
-            else:
-                messages.append({"role": "assistant", "content": answer_text})
+            if not msg.tool_calls:
+                answer_text = (msg.content or "").strip()
+                if not answer_text:
+                    # The model returned nothing useful — ask it explicitly to
+                    # summarize based on whatever was found, instead of showing
+                    # a blank response to the user.
+                    messages.append({"role": "assistant", "content": msg.content or ""})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You didn't provide a clear answer. Based on everything "
+                            "you've explored and queried so far, give your best "
+                            "direct answer now, in plain language."
+                        ),
+                    })
+                    retry = client.chat.completions.create(
+                        model=MODEL, messages=messages, tools=tools, tool_choice="none"
+                    )
+                    answer_text = (retry.choices[0].message.content or
+                                   "I wasn't able to find a clear answer — could you rephrase the question, "
+                                   "or try a simpler one?").strip()
+                    messages.append({"role": "assistant", "content": answer_text})
+                else:
+                    messages.append({"role": "assistant", "content": answer_text})
 
-            return {
-                "answer": answer_text,
-                "sql": last_sql,
-                "rows": last_rows,
-                "tool_log": tool_log,
-                "history": messages,
-            }
-
-        messages.append({
-            "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
+                return {
+                    "answer": answer_text,
+                    "sql": last_sql,
+                    "rows": last_rows,
+                    "tool_log": tool_log,
+                    "history": messages,
                 }
-                for tc in msg.tool_calls
-            ],
-        })
-
-        for tool_call in msg.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments or "{}")
-
-            if name in TOOL_FUNCTIONS:
-                result = TOOL_FUNCTIONS[name](args)
-            else:
-                result = {"error": f"Unknown tool: {name}"}
-
-            # Log what the agent did, in plain form, for display in the UI
-            if name == "list_tables":
-                tool_log.append("Explored: listed all tables")
-            elif name == "get_table_schema":
-                tool_log.append(f"Explored: inspected columns of '{args.get('table_name')}'")
-            elif name == "run_sql_query":
-                last_sql = args.get("query")
-                last_rows = result.get("rows")
-                tool_log.append(f"Ran SQL query")
 
             messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result),
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
             })
+
+            for tool_call in msg.tool_calls:
+                name = tool_call.function.name
+                raw_args = tool_call.function.arguments or "{}"
+
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+
+                call_key = (name, raw_args)
+
+                if call_key in seen_calls:
+                    # The agent is repeating an identical call — don't waste
+                    # a round re-running it, just tell it to move on.
+                    result = {
+                        "note": (
+                            "You already made this exact call earlier in this "
+                            "conversation — see the result above. Do not repeat "
+                            "it; use that information to proceed to the next step "
+                            "(inspecting another table, or running your SQL query)."
+                        )
+                    }
+                    tool_log.append(f"(skipped repeated call: {name})")
+                else:
+                    seen_calls[call_key] = True
+                    if name in TOOL_FUNCTIONS:
+                        result = TOOL_FUNCTIONS[name](args)
+                    else:
+                        result = {"error": f"Unknown tool: {name}"}
+                        tool_log.append(f"(agent tried unknown tool: {name})")
+
+                    if name == "list_tables":
+                        tool_log.append("Explored: listed all tables")
+                    elif name == "get_table_schema":
+                        tool_log.append(f"Explored: inspected columns of '{args.get('table_name')}'")
+                    elif name == "run_sql_query":
+                        last_sql = args.get("query")
+                        last_rows = result.get("rows")
+                        tool_log.append("Ran SQL query")
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                })
+
+        # Exhausted all rounds without a clean return (shouldn't normally
+        # happen since the last round forces tool_choice="none").
+        return {
+            "answer": "I got stuck exploring the database and couldn't finish answering — could you try rephrasing your question?",
+            "sql": last_sql,
+            "rows": last_rows,
+            "tool_log": tool_log,
+            "history": messages,
+        }
+
+    except Exception as e:
+        # Surface the real error in the chat instead of failing silently
+        # or crashing the whole app.
+        return {
+            "answer": f"⚠️ The agent hit an internal error and couldn't finish: {type(e).__name__}: {e}",
+            "sql": last_sql,
+            "rows": last_rows,
+            "tool_log": tool_log,
+            "history": history,  # roll back to last known-good history
+        }
 
 
 if __name__ == "__main__":
