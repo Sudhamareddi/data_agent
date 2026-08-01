@@ -16,12 +16,22 @@ Deploy for FREE on Streamlit Community Cloud:
   4. Deploy
 """
 
-
 import streamlit as st
 import pandas as pd
 from data_agent import ask_agent
 
 st.set_page_config(page_title="Music Store Data Agent", page_icon="🎵", layout="centered")
+
+with st.sidebar:
+    st.subheader("Session")
+    st.write(
+        "This agent remembers earlier questions in the conversation. If it "
+        "seems confused or stuck on a bad guess from before, reset here."
+    )
+    if st.button("🔄 New conversation (clear memory)"):
+        st.session_state.display_messages = []
+        st.session_state.agent_history = None
+        st.rerun()
 
 st.title("🎵 Music Store Data Analytics Agent")
 st.write(
@@ -55,7 +65,7 @@ def try_build_chart(rows):
     return df.set_index(label_col)
 
 
-def render_assistant_extras(sql, tool_log, chart_df):
+def render_assistant_extras(sql, tool_log, chart_df, rows):
     if tool_log:
         with st.expander(f"🔍 Agent's exploration steps ({len(tool_log)})"):
             for step in tool_log:
@@ -63,6 +73,12 @@ def render_assistant_extras(sql, tool_log, chart_df):
     if sql:
         with st.expander("SQL query used"):
             st.code(sql, language="sql")
+    # Always show the actual raw result, regardless of what the agent's
+    # text summary says — this is the ground truth, so if the summary text
+    # is ever wrong, you can still see the real data right here.
+    if rows:
+        with st.expander(f"Raw query result ({len(rows)} row{'s' if len(rows) != 1 else ''})"):
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
     if chart_df is not None:
         st.bar_chart(chart_df)
 
@@ -71,7 +87,9 @@ for msg in st.session_state.display_messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
         if msg["role"] == "assistant":
-            render_assistant_extras(msg.get("sql"), msg.get("tool_log"), msg.get("chart"))
+            render_assistant_extras(
+                msg.get("sql"), msg.get("tool_log"), msg.get("chart"), msg.get("rows")
+            )
 
 question = st.chat_input("Ask a question about the music store data...")
 
@@ -88,7 +106,7 @@ if question:
         st.write(result["answer"])
 
         chart_df = try_build_chart(result["rows"]) if result["rows"] else None
-        render_assistant_extras(result["sql"], result["tool_log"], chart_df)
+        render_assistant_extras(result["sql"], result["tool_log"], chart_df, result["rows"])
 
     st.session_state.display_messages.append({
         "role": "assistant",
@@ -96,4 +114,5 @@ if question:
         "sql": result["sql"],
         "tool_log": result["tool_log"],
         "chart": chart_df,
+        "rows": result["rows"],
     })
