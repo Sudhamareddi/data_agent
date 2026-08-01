@@ -155,9 +155,17 @@ def ask_agent(question: str, history: list | None = None):
                     "relationships between tables may go through a foreign key column "
                     "rather than a direct table name match. Always inspect a table's "
                     "schema with get_table_schema before assuming its columns.\n\n"
+                    "CRITICAL: When you write SQL, use table and column names EXACTLY "
+                    "as they were returned by list_tables and get_table_schema — same "
+                    "spelling, same singular/plural form, same capitalization. Never "
+                    "pluralize, rename, or paraphrase a name (e.g. if the real table is "
+                    "'Employee', do not write 'Employees'; if a column is 'SupportRepId', "
+                    "do not invent 'EmployeeID').\n\n"
                     "Always finish by giving a direct, plain-language answer to the "
                     "user's question — never end a turn with only a tool call and no "
-                    "explanation."
+                    "explanation. If you are not able to call a tool, do not write out "
+                    "fake tool-call syntax as text — just answer directly in plain "
+                    "language using whatever you've already learned."
                 ),
             }
         ]
@@ -188,7 +196,12 @@ def ask_agent(question: str, history: list | None = None):
 
             if not msg.tool_calls:
                 answer_text = (msg.content or "").strip()
-                if not answer_text:
+                # Some models, when denied tool access, write out fake
+                # tool-call syntax as plain text instead of a real answer
+                # (e.g. "<function=run_sql_query>{...}</function>"). Catch
+                # that so it's never shown to the user as if it were valid.
+                looks_fake = "<function=" in answer_text or "<function_call" in answer_text
+                if not answer_text or looks_fake:
                     # The model returned nothing useful — ask it explicitly to
                     # summarize based on whatever was found, instead of showing
                     # a blank response to the user.
@@ -196,17 +209,24 @@ def ask_agent(question: str, history: list | None = None):
                     messages.append({
                         "role": "user",
                         "content": (
-                            "You didn't provide a clear answer. Based on everything "
-                            "you've explored and queried so far, give your best "
-                            "direct answer now, in plain language."
+                            "That wasn't a valid answer (either empty, or it contained "
+                            "tool-call syntax instead of a real response). Based on "
+                            "everything you've already explored and queried in this "
+                            "conversation, write your best direct answer now in plain "
+                            "language only — no code, no tool syntax."
                         ),
                     })
                     retry = client.chat.completions.create(
                         model=MODEL, messages=messages, tools=tools, tool_choice="none"
                     )
-                    answer_text = (retry.choices[0].message.content or
-                                   "I wasn't able to find a clear answer — could you rephrase the question, "
-                                   "or try a simpler one?").strip()
+                    retry_text = (retry.choices[0].message.content or "").strip()
+                    if not retry_text or "<function=" in retry_text or "<function_call" in retry_text:
+                        answer_text = (
+                            "I wasn't able to find a clear answer — could you rephrase "
+                            "the question, or try a simpler one?"
+                        )
+                    else:
+                        answer_text = retry_text
                     messages.append({"role": "assistant", "content": answer_text})
                 else:
                     messages.append({"role": "assistant", "content": answer_text})
