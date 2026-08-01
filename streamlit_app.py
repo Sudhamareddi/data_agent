@@ -34,17 +34,22 @@ with st.sidebar:
         st.rerun()
 
 st.title("🎵 Music Store Data Analytics Agent")
-st.write(
-    "Ask natural-language questions about a real multi-table music store "
-    "database. The agent doesn't know the schema in advance — watch it "
-    "explore the tables and columns itself before writing SQL."
-)
+st.markdown(
+    """
+**What this is:** An AI agent that answers plain-English questions about a real
+multi-table sales database — without being told the database structure in advance.
+It explores the tables itself, writes its own SQL (including multi-table joins),
+and shows its work: what it explored, the SQL it ran, and the raw data behind
+every answer.
 
-with st.expander("Example questions"):
-    st.write("- Who are the top 5 customers by total spending?")
-    st.write("- Which genre has the most tracks?")
-    st.write("- Which employee has generated the most sales?")
-    st.write("- Now break that down by country")
+**Try asking:**
+- *Who are the top 5 customers by total spending?*
+- *Which genre has the most tracks?*
+- *Which employee has generated the most sales?*
+- *Which artist has generated the most revenue, and how many unique customers bought their music?*
+- Then a follow-up like: *"Now break that down by country"* — it remembers context.
+"""
+)
 
 if "display_messages" not in st.session_state:
     st.session_state.display_messages = []
